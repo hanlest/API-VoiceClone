@@ -34,7 +34,7 @@ import os
 import re
 from dataclasses import dataclass, fields
 from functools import partial
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 import torch
@@ -601,6 +601,7 @@ class OmniVoice(PreTrainedModel):
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
         normalize_text: bool = False,
+        on_progress: Optional[Callable[[int, int], None]] = None,
         **kwargs,
     ) -> list[np.ndarray]:
         """Generate speech audio given text in various modes.
@@ -644,6 +645,8 @@ class OmniVoice(PreTrainedModel):
                 tone markers) is preserved. See :func:`omnivoice.utils.text.normalize_text`.
             generation_config: Explicit config object. If provided, takes
                 precedence over ``**kwargs``.
+            on_progress: Optional ``callback(step, total_steps)`` invoked once
+                the step count is known and after each decoding step.
             **kwargs: Generation config or its fields:
                 denoise: Whether to prepend the ``<|denoise|>`` token.
                 num_step: Number of iterative decoding steps.
@@ -682,6 +685,24 @@ class OmniVoice(PreTrainedModel):
 
         self.eval()
 
+        done_steps = 0
+        total_steps = 0
+
+        def _plan(count: int) -> None:
+            nonlocal total_steps
+            total_steps += count
+            if on_progress is not None:
+                on_progress(done_steps, total_steps)
+
+        def _advance() -> None:
+            nonlocal done_steps
+            done_steps += 1
+            if on_progress is not None:
+                on_progress(done_steps, total_steps)
+
+        if on_progress is not None:
+            on_progress(0, 0)
+
         full_task = self._preprocess_all(
             text=text,
             language=language,
@@ -703,13 +724,21 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
+            _plan(gen_config.num_step)
+            short_results = self._generate_iterative(
+                short_task, gen_config, on_step=_advance
+            )
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
         if long_idx:
             long_task = full_task.slice_task(long_idx)
-            long_results = self._generate_chunked(long_task, gen_config)
+            long_results = self._generate_chunked(
+                long_task,
+                gen_config,
+                on_step=_advance,
+                on_planned_steps=_plan,
+            )
             for idx, res in zip(long_idx, long_results):
                 results[idx] = res
 
@@ -911,7 +940,11 @@ class OmniVoice(PreTrainedModel):
         return generated_audio
 
     def _generate_chunked(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self,
+        task: GenerationTask,
+        gen_config: OmniVoiceGenerationConfig,
+        on_step: Optional[Callable[[], None]] = None,
+        on_planned_steps: Optional[Callable[[int], None]] = None,
     ) -> List[List[torch.Tensor]]:
         """Generate long audio by splitting text into chunks and batching.
 
@@ -950,6 +983,13 @@ class OmniVoice(PreTrainedModel):
         )
 
         max_num_chunks = max(len(c) for c in all_chunks)
+        planned_batches = sum(
+            1
+            for ci in range(max_num_chunks)
+            if any(ci < len(chunks) for chunks in all_chunks)
+        )
+        if on_planned_steps is not None:
+            on_planned_steps(planned_batches * gen_config.num_step)
 
         # chunk_results[item_idx] = list of generated token tensors per chunk
         chunk_results = [[] for _ in range(task.batch_size)]
@@ -976,7 +1016,9 @@ class OmniVoice(PreTrainedModel):
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
+            gen_tokens = self._generate_iterative(
+                sub_task, gen_config, on_step=on_step
+            )
             for j, idx in enumerate(indices):
                 chunk_results[idx].append(gen_tokens[j])
 
@@ -1273,7 +1315,10 @@ class OmniVoice(PreTrainedModel):
         }
 
     def _generate_iterative(
-        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+        self,
+        task: GenerationTask,
+        gen_config: OmniVoiceGenerationConfig,
+        on_step: Optional[Callable[[], None]] = None,
     ) -> List[torch.Tensor]:
         """N-step iterative unmasked decoding.
 
@@ -1423,6 +1468,9 @@ class OmniVoice(PreTrainedModel):
                 tokens[i : i + 1, :, :t_len] = sample_tokens
                 batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
                 batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+            if on_step is not None:
+                on_step()
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 

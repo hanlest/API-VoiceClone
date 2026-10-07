@@ -17,6 +17,8 @@ build/
 /.tmp/
 /results/
 /data/
+/voices/
+/outputs/
 /download
 /local/
 /run*

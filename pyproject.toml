@@ -36,6 +36,9 @@ dependencies = [
     "accelerate",
     "pydub",
     "gradio",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "python-multipart>=0.0.9",
     "tensorboardX",
     "webdataset",
     "numpy",
@@ -68,6 +71,7 @@ omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-merge-lora = "omnivoice.cli.merge_lora:main"
+omnivoice-api = "omnivoice.api.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"
