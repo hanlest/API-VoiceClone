@@ -66,6 +66,10 @@ lora = [
     "peft>=0.20.0",       # LoRA fine-tuning support
 ]
 
+xtts = [
+    "coqui-tts>=0.27.4",  # XTTS-v2 cross-language cloning
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"

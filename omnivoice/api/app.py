@@ -40,6 +40,7 @@ from fastapi.responses import (
 from pydantic import BaseModel, BeforeValidator, Field
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig, VoiceClonePrompt, __version__
+from omnivoice.api.xtts import router as xtts_router
 from omnivoice.utils.audio import load_audio_bytes
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
@@ -47,6 +48,8 @@ from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 logger = logging.getLogger("omnivoice.api")
 
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
+REFERENCE_CLIP_SECONDS = 30
+REFERENCE_CLIP_NAME = "reference.wav"
 
 Gender = Literal["male", "female"]
 Age = Literal["child", "teenager", "young adult", "middle-aged", "elderly"]
@@ -560,7 +563,7 @@ def _error_detail(exc: HTTPException) -> str:
 
 
 async def _sse_events(
-    kwargs: dict,
+    produce,
     audio_response: AudioResponseMode,
     audio_format: AudioFormat,
     base_url: str,
@@ -573,9 +576,7 @@ async def _sse_events(
     def on_progress(step: int, total: int) -> None:
         progress_queue.put(_progress_payload(step, total))
 
-    task = asyncio.create_task(
-        asyncio.to_thread(_encode_audio, kwargs, audio_format, on_progress)
-    )
+    task = asyncio.create_task(asyncio.to_thread(produce, on_progress))
     loop = asyncio.get_running_loop()
     last_keepalive = loop.time()
     while not task.done() or not progress_queue.empty():
@@ -612,7 +613,7 @@ async def _sse_events(
 
 def _run_job(
     job_id: str,
-    kwargs: dict,
+    produce,
     audio_response: AudioResponseMode,
     audio_format: AudioFormat,
     base_url: str,
@@ -628,7 +629,7 @@ def _run_job(
                 job.update(_progress_payload(step, total))
 
     try:
-        payload, sampling_rate = _encode_audio(kwargs, audio_format, on_progress)
+        payload, sampling_rate = produce(on_progress)
         result = _pack_audio(payload, sampling_rate, audio_response, audio_format, base_url)
     except HTTPException as exc:
         with _jobs_lock:
@@ -652,7 +653,7 @@ def _run_job(
 
 
 def _start_job(
-    kwargs: dict,
+    produce,
     audio_response: AudioResponseMode,
     audio_format: AudioFormat,
     base_url: str,
@@ -673,7 +674,7 @@ def _start_job(
         }
     threading.Thread(
         target=_run_job,
-        args=(job_id, kwargs, audio_response, audio_format, base_url),
+        args=(job_id, produce, audio_response, audio_format, base_url),
         daemon=True,
     ).start()
     return JSONResponse(
@@ -692,20 +693,26 @@ async def _deliver(
     filename: str,
     delivery: DeliveryOptions,
 ):
+    def produce(on_progress=None):
+        return _encode_audio(kwargs, delivery.audio_format, on_progress)
+
+    return await _deliver_produced(request, produce, filename, delivery)
+
+
+async def _deliver_produced(request: Request, produce, filename: str, delivery: DeliveryOptions):
+    """Entrega audio ya generado. ``produce(on_progress)`` devuelve bytes y sample rate."""
     base_url = _base_url(request)
     spec = _AUDIO_FORMATS[delivery.audio_format]
     filename = f"{filename}.{spec['extension']}"
     if delivery.generation_mode == "job":
-        return _start_job(kwargs, delivery.audio_response, delivery.audio_format, base_url)
+        return _start_job(produce, delivery.audio_response, delivery.audio_format, base_url)
     if delivery.generation_mode == "sse":
         return StreamingResponse(
-            _sse_events(kwargs, delivery.audio_response, delivery.audio_format, base_url),
+            _sse_events(produce, delivery.audio_response, delivery.audio_format, base_url),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    payload, sampling_rate = await asyncio.to_thread(
-        _encode_audio, kwargs, delivery.audio_format
-    )
+    payload, sampling_rate = await asyncio.to_thread(produce, None)
     if delivery.audio_response == "archivo":
         return _audio_response(payload, sampling_rate, filename, spec["media_type"])
     return _pack_audio(
@@ -799,6 +806,7 @@ def _create_saved_voice(
         folder.mkdir(parents=True, exist_ok=False)
         try:
             prompt.save(str(folder / "prompt.pt"))
+            _write_reference_clip(folder, waveform, model.sampling_rate)
             voice = SavedVoice(
                 id=voice_id,
                 name=name,
@@ -816,6 +824,17 @@ def _create_saved_voice(
         return voice
     finally:
         _release_model_user()
+
+
+def _write_reference_clip(folder: Path, waveform: np.ndarray, sampling_rate: int) -> None:
+    """Guarda hasta 30 s del audio original para reutilizarlo en XTTS."""
+    audio = np.asarray(waveform, dtype=np.float32)
+    if audio.ndim == 2:
+        audio = np.mean(audio, axis=0) if audio.shape[0] > 1 else audio[0]
+    limit = sampling_rate * REFERENCE_CLIP_SECONDS
+    if audio.shape[0] > limit:
+        audio = audio[:limit]
+    sf.write(folder / REFERENCE_CLIP_NAME, audio, sampling_rate, format="WAV")
 
 
 @asynccontextmanager
@@ -875,13 +894,17 @@ app = FastAPI(
         "voces guardadas y síntesis con género, edad y tono. "
         "Cada síntesis puede esperar el resultado, emitirlo por SSE o dejarlo en un trabajo, "
         "y devolver el audio como archivo, base64 o URL en wav, flac, ogg, mp3 o aiff. "
-        "Sin peticiones, OmniVoice y Whisper salen de la VRAM y se vuelven a cargar en la siguiente síntesis."
+        "Sin peticiones, OmniVoice y Whisper salen de la VRAM y se vuelven a cargar en la siguiente síntesis. "
+        "XTTS-v2 clona un audio y habla en otro idioma: POST /v1/xtts/synthesize con un archivo, "
+        "o POST /v1/xtts/voices/{voice_id}/synthesize con una voz guardada."
     ),
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
     lifespan=lifespan,
 )
+
+app.include_router(xtts_router)
 
 
 def _inject_voice_select(schema: dict) -> None:
@@ -1003,7 +1026,10 @@ async def create_voice(
     name: str = Form(..., description="Nombre para reconocer la voz en el listado."),
     reference_audio: UploadFile = File(
         ...,
-        description="Audio de referencia. Lo recomendable son 3 a 10 segundos.",
+        description=(
+            "Audio de referencia. OmniVoice rinde mejor con 3 a 10 segundos. "
+            "Se conserva un clip de hasta 30 segundos para usarlo en XTTS."
+        ),
     ),
     language: MainLanguage = Form(
         ...,
@@ -1014,7 +1040,7 @@ async def create_voice(
         description="Transcripción del audio. Si se omite, Whisper la transcribe.",
     ),
 ):
-    """Codifica el audio una vez y guarda la voz para reutilizarla."""
+    """Codifica el audio para OmniVoice y guarda hasta 30 segundos del original para XTTS."""
     cleaned_name = name.strip()
     if not cleaned_name:
         raise HTTPException(status_code=400, detail="El nombre de la voz está vacío.")
