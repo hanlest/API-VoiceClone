@@ -102,6 +102,16 @@ class HealthResponse(BaseModel):
     model_loaded: bool
 
 
+class ModelLoadResponse(BaseModel):
+    status: str
+    model: str
+    device: str
+    sampling_rate: int | None = None
+    asr_enabled: bool
+    already_loaded: bool
+    vram_reserved_mib: float | None = None
+
+
 class LanguageList(BaseModel):
     languages: list[str]
 
@@ -317,6 +327,18 @@ def _unload_now() -> None:
         if model is None:
             return
         _release_gpu(model)
+
+
+def _mount_omnivoice() -> bool:
+    """Carga OmniVoice en memoria sin contar como petición de síntesis activa."""
+    global _last_used
+    with _model_lock:
+        if getattr(app.state, "model", None) is not None:
+            _last_used = time.monotonic()
+            return True
+        app.state.model = _load_model()
+        _last_used = time.monotonic()
+        return False
 
 
 async def _sampling_rate() -> int:
@@ -984,6 +1006,35 @@ def health():
         sampling_rate=getattr(app.state, "sampling_rate", None),
         asr_enabled=not settings.no_asr,
         model_loaded=model is not None,
+    )
+
+
+@app.post(
+    "/v1/model/load",
+    response_model=ModelLoadResponse,
+    tags=["Sistema"],
+    summary="Montar OmniVoice en VRAM",
+)
+async def load_model():
+    """Carga el checkpoint de OmniVoice (y Whisper si está habilitado) sin sintetizar audio."""
+    settings: Settings = getattr(app.state, "settings", None) or load_settings()
+    device = str(getattr(app.state, "device", "") or "")
+    try:
+        already_loaded = await asyncio.to_thread(_mount_omnivoice)
+    except Exception as exc:
+        logger.exception("No se pudo cargar OmniVoice")
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo cargar el modelo: {type(exc).__name__}: {exc}",
+        ) from exc
+    return ModelLoadResponse(
+        status="ok",
+        model=settings.model,
+        device=device,
+        sampling_rate=getattr(app.state, "sampling_rate", None),
+        asr_enabled=not settings.no_asr,
+        already_loaded=already_loaded,
+        vram_reserved_mib=_cuda_reserved_mib(),
     )
 
 

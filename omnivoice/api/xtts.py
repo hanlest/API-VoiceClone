@@ -6,6 +6,7 @@ El audio de referencia solo aporta el timbre. El idioma de ese clip no se pide:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import Literal
 import numpy as np
 import soundfile as sf
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from pydantic import BaseModel
 
 from omnivoice.utils.common import get_best_device
 
@@ -68,6 +70,16 @@ _LANGUAGES = {
 }
 
 router = APIRouter(prefix="/v1/xtts", tags=["XTTS"])
+
+
+class XttsModelLoadResponse(BaseModel):
+    status: str
+    model: str
+    device: str
+    sampling_rate: int | None = None
+    already_loaded: bool
+    vram_reserved_mib: float | None = None
+
 
 _model = None
 _model_lock = threading.Lock()
@@ -123,6 +135,25 @@ def _load_model():
                 detail=f"No se pudo cargar XTTS-v2: {type(exc).__name__}: {exc}",
             ) from exc
         return _model
+
+
+def _mount_xtts() -> bool:
+    with _model_lock:
+        already_loaded = _model is not None
+    if already_loaded:
+        return True
+    _load_model()
+    return False
+
+
+def _xtts_device() -> str:
+    model = _model
+    if model is None:
+        return get_best_device()
+    try:
+        return str(next(model.parameters()).device)
+    except StopIteration:
+        return get_best_device()
 
 
 def _synthesize(
@@ -453,6 +484,41 @@ def _saved_reference_path(voice_id: str) -> Path:
             ),
         )
     return clip
+
+
+@router.post(
+    "/model/load",
+    response_model=XttsModelLoadResponse,
+    summary="Montar XTTS-v2 en VRAM",
+)
+async def load_xtts_model():
+    """Carga el checkpoint de XTTS-v2 sin sintetizar audio."""
+    from omnivoice.api.app import _cuda_reserved_mib
+
+    try:
+        already_loaded = await asyncio.to_thread(_mount_xtts)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("No se pudo cargar XTTS-v2")
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo cargar XTTS-v2: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    model = _model
+    sample_rate = None
+    if model is not None:
+        sample_rate = int(getattr(model.synthesizer, "output_sample_rate", 24000))
+
+    return XttsModelLoadResponse(
+        status="ok",
+        model=MODEL_NAME,
+        device=_xtts_device(),
+        sampling_rate=sample_rate,
+        already_loaded=already_loaded,
+        vram_reserved_mib=_cuda_reserved_mib(),
+    )
 
 
 @router.post(
